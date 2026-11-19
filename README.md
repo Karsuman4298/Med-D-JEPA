@@ -42,13 +42,44 @@ Med-D-JEPA operates in three stages:
 
 ---
 
-## Key Dimensions & Specifications
+## Dataset Specifications & Train-Test Splits
 
-| Dataset | Volume Scope | Resolution | VAE Downsample | Latent Grid ($c_z \times h \times w \times d$) | Patch Size ($p$) | Token Count ($N$) | Token Dim ($d_p$) | Classes |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **BraTS2019** | Tumor ROI (FLAIR) | $128 \times 128 \times 128$ | $8\times$ | $4 \times 16 \times 16 \times 16$ | $2 \times 2 \times 2$ | **512** | $4 \times 2^3 = \mathbf{32}$ | 2 (LGG / HGG) |
-| **OASIS-1** | Whole-Brain (T1) | $128 \times 128 \times 128$ | $8\times$ | $4 \times 16 \times 16 \times 16$ | $2 \times 2 \times 2$ | **512** | $4 \times 2^3 = \mathbf{32}$ | 2 (CN / AD) |
-| **BraTS2020** | Whole-Brain (FLAIR) | $256 \times 256 \times 256$ | $8\times$ | $4 \times 32 \times 32 \times 32$ | $2 \times 2 \times 2$ | **4,096** | $4 \times 2^3 = \mathbf{32}$ | 1 (Unconditional) |
+The paper uses three public brain MRI benchmarks with strict 80/20 train-test splits (the test cohorts are completely excluded from Stage I, Stage II, and all downstream training):
+
+| Dataset | Modality & Scope | Resolution | Split | Train Count | Test Count (Held Out) | Classes |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **BraTS2019** | FLAIR (Tumor ROI) | $128^3$ | 80/20 | 285 (234 HGG, 51 LGG) | **50** (25 HGG, 25 LGG) | 0: LGG, 1: HGG |
+| **OASIS-1** | T1 (Whole-Brain) | $128^3$ | 80/20 | 356 patients | **60** (30 CN, 30 AD) | 0: CN (CDR=0), 1: AD (CDR>0) |
+| **BraTS2020** | FLAIR (Whole-Brain) | $256^3$ | 80/20 | 295 patients | **74** patients | Unconditional |
+
+### Directory Arrangement
+
+Arrange your preprocessed datasets in the following structure:
+
+```
+data/
+├── brats2019_128/
+│   ├── train/
+│   │   ├── 0/             # 51 LGG patient volumes (.npy)
+│   │   └── 1/             # 234 HGG patient volumes (.npy)
+│   └── test/              # Held-out test set
+│       ├── 0/             # 25 LGG patient volumes (.npy)
+│       └── 1/             # 25 HGG patient volumes (.npy)
+│
+├── oasis1_128/
+│   ├── train/
+│   │   ├── 0/             # Cognitively Normal (CN, CDR = 0) (.npy)
+│   │   └── 1/             # Cognitively Impaired (AD, CDR ∈ {0.5, 1, 2}) (.npy)
+│   └── test/              # Held-out test set
+│       ├── 0/             # 30 CN held-out volumes (.npy)
+│       └── 1/             # 30 AD held-out volumes (.npy)
+│
+└── brats2020_256/
+    ├── train/
+    │   └── 0/             # 295 whole-brain FLAIR volumes (.npy)
+    └── test/              # Held-out test set
+        └── 0/             # 74 held-out volumes (.npy)
+```
 
 ---
 
@@ -104,30 +135,42 @@ Operates on non-overlapping 3D patches $X = \{x_i\}_{i=1}^N \in \mathbb{R}^{d_p}
 
 ---
 
-## Reproduction & Usage Guide
+## Reproduction Guide: Step-by-Step
 
-### 1. Data Preparation
-Normalize all brain MRI volumes to $[0, 1]$ and save as `.npy` or `.pt` tensors of shape `(1, 128, 128, 128)` (or `(1, 256, 256, 256)`).
-Organize by class for conditional generation:
-```
-data/brats2019_128/
-  ├── 0/   # Low-Grade Glioma (LGG)
-  │   ├── vol_001.npy
-  │   └── ...
-  └── 1/   # High-Grade Glioma (HGG)
-      ├── vol_101.npy
-      └── ...
+### Step 1: Automated Data Preprocessing
+Use [`prepare_data.py`](prepare_data.py) to automatically process raw NIfTI files into the exact train/test splits, crop tumor ROIs, resample to $128^3$ or $256^3$, and normalize intensities to $[0, 1]$:
+
+```bash
+# For BraTS 2019:
+python prepare_data.py \
+  --dataset brats2019 \
+  --raw_dir /path/to/MICCAI_BraTS_2019_Data_Training \
+  --output_dir ./data/brats2019_128
+
+# For OASIS-1:
+python prepare_data.py \
+  --dataset oasis1 \
+  --raw_dir /path/to/OASIS1_raw \
+  --output_dir ./data/oasis1_128
+
+# For BraTS 2020:
+python prepare_data.py \
+  --dataset brats2020 \
+  --raw_dir /path/to/BraTS20_Training_Data \
+  --output_dir ./data/brats2020_256
 ```
 
-### 2. Stage I: Train 3D KL-VAE-GAN
-Train the volume compression autoencoder:
+---
+
+### Step 2: Stage I (3D KL-VAE-GAN Training)
+Train the volume compression autoencoder on the training set:
 ```bash
 bash scripts/train_med_stage1.sh
 ```
-Or run directly:
+Or directly:
 ```bash
 python train_stage1_vae.py \
-  --data_path ./data/brats2019_128 \
+  --data_path ./data/brats2019_128/train \
   --output_dir ./exps/stage1_vae \
   --img_size 128 \
   --batch_size 4 \
@@ -136,23 +179,27 @@ python train_stage1_vae.py \
   --min_lr 1e-6 \
   --warmup_steps 1000
 ```
-*Saves the trained VAE to `pretrained_models/vae/med_vae3d.pt`.*
+*Outputs: Saved 3D VAE checkpoint to `pretrained_models/vae/med_vae3d.pt`.*
 
-### 3. Extract & Cache 3D Latents
-Encode volumes to continuous 3D latents $(4 \times 16 \times 16 \times 16)$ for Stage II training:
+---
+
+### Step 3: Extract & Cache 3D Latents
+Encode volumes to continuous 3D latents $(4 \times 16 \times 16 \times 16)$ for rapid Stage II training:
 ```bash
 bash scripts/cache_med_latents.sh
 ```
-Or run directly:
+Or directly:
 ```bash
 python main_cache_3d.py \
-  --data_path ./data/brats2019_128 \
+  --data_path ./data/brats2019_128/train \
   --cached_path ./cached_latents/brats2019 \
   --vae MED_VAE_3D \
   --batch_size 4
 ```
 
-### 4. Stage II: Train Med-D-JEPA
+---
+
+### Step 4: Stage II (Train Med-D-JEPA)
 Train the continuous joint-embedding model on the cached latents:
 ```bash
 torchrun --nproc_per_node=4 main_djepa.py \
@@ -173,27 +220,55 @@ torchrun --nproc_per_node=4 main_djepa.py \
   --use_cached
 ```
 
-### 5. Stage III: Iterative 3D Latent Generation
-Synthesize 3D MRI volumes using $K = 64$ autoregressive iterations and CFG scale $2.0$:
+---
+
+### Step 5: Stage III (Iterative 3D Latent Generation)
+Synthesize 300 volumes per class with $K = 64$ AR iterations and $s_{\text{cfg}} = 2.0$:
 ```bash
-bash scripts/generate_med_stage3.sh
-```
-Or run with custom parameters:
-```bash
+# Generate 300 synthetic LGG volumes (class 0)
 python generate_stage3_3d.py \
   --vae_ckpt pretrained_models/vae/med_vae3d.pt \
   --ckpt_path exps/med_djepa/checkpoint-last.pth \
-  --output_dir ./generated_samples/brats2019 \
-  --num_volumes 50 \
-  --batch_size 2 \
+  --output_dir ./generated_samples/brats2019/class0 \
+  --num_volumes 300 \
+  --class_idx 0 \
   --num_ar_steps 64 \
   --cfg_scale 2.0 \
+  --img_size 128
+
+# Generate 300 synthetic HGG volumes (class 1)
+python generate_stage3_3d.py \
+  --vae_ckpt pretrained_models/vae/med_vae3d.pt \
+  --ckpt_path exps/med_djepa/checkpoint-last.pth \
+  --output_dir ./generated_samples/brats2019/class1 \
+  --num_volumes 300 \
   --class_idx 1 \
+  --num_ar_steps 64 \
+  --cfg_scale 2.0 \
   --img_size 128
 ```
-*Outputs:*
-- `vol_0000_cls1.npy`: 3D synthesized volume `(1, 128, 128, 128)`
-- `ortho_0000_cls1.png`: Triptych showing central **Axial**, **Coronal**, and **Sagittal** slices.
+
+---
+
+### Step 6: Quantitative Metric Evaluation (Tables 1, 2, 9, 10)
+Evaluate 3D Maximum Mean Discrepancy (MMD) and Multi-Slice SSIM against the real held-out test cohort:
+```bash
+python evaluate_metrics_3d.py \
+  --real_dir ./data/brats2019_128/test/1 \
+  --fake_dir ./generated_samples/brats2019/class1
+```
+
+---
+
+## Paper Ablation Checklist
+
+To reproduce the ablation studies from the paper:
+- **AR Steps Ablation (Table 6 & Table 11)**:
+  Run `generate_stage3_3d.py` with `--num_ar_steps` set to `8`, `16`, `32`, `64`, `256`, and `512`.
+- **JEPA Prediction Loss Ablation (Table 7)**:
+  Train Stage II with `--jepa_weight 0.0` (w/o $\mathcal{L}_{\text{pred}}$) vs `--jepa_weight 1.0` (Med-D-JEPA).
+- **CFG Scale Ablation (Table 12)**:
+  Run `generate_stage3_3d.py` with `--cfg_scale` set to `2.0`, `2.5`, `3.0`, `3.5`, and `4.0`.
 
 ---
 
@@ -210,6 +285,8 @@ python generate_stage3_3d.py \
 ├── train_stage1_vae.py        # Stage I 3D VAE-GAN training pipeline
 ├── main_cache_3d.py           # Stage I 3D latent caching script
 ├── generate_stage3_3d.py      # Stage III iterative 3D generation & slice visualization script
+├── prepare_data.py            # Dataset preprocessing (BraTS2019, OASIS-1, BraTS2020)
+├── evaluate_metrics_3d.py     # Quantitative evaluation (3D MMD, MS-SSIM)
 ├── main_djepa.py              # Stage II training script
 ├── engine/                    # Training and evaluation loops
 └── scripts/
