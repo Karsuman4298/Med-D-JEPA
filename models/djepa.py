@@ -14,9 +14,10 @@ from models.jepaloss import JepaLoss
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
-    masking = torch.zeros(bsz, seq_len).cuda()
+    device = order.device
+    masking = torch.zeros(bsz, seq_len, device=device)
     masking = torch.scatter(
-        masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len).cuda()).bool()
+        masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len, device=device)).bool()
     return masking
 
 
@@ -46,20 +47,29 @@ class DJEPA(nn.Module):
                  diffloss: str = "gauss",  # gauss, flow, none
                  jepaloss: str = "jepa",  # jepa, none
                  grad_checkpointing: bool = False,
+                 spatial_dims: int = 2,
                  **ignored_kwargs,
                  ):
         super().__init__()
 
         # --------------------------------------------------------------------------
         # VAE and patchify specifics
+        self.spatial_dims = spatial_dims
         self.vae_embed_dim = vae_embed_dim
 
         self.img_size = img_size
         self.vae_stride = vae_stride
         self.patch_size = patch_size
-        self.seq_h = self.seq_w = img_size // vae_stride // patch_size
-        self.seq_len = self.seq_h * self.seq_w
-        self.token_embed_dim = vae_embed_dim * patch_size**2
+
+        if self.spatial_dims == 3:
+            self.seq_h = self.seq_w = self.seq_d = img_size // vae_stride // patch_size
+            self.seq_len = self.seq_h * self.seq_w * self.seq_d
+            self.token_embed_dim = vae_embed_dim * (patch_size ** 3)
+        else:
+            self.seq_h = self.seq_w = img_size // vae_stride // patch_size
+            self.seq_len = self.seq_h * self.seq_w
+            self.token_embed_dim = vae_embed_dim * (patch_size ** 2)
+
         self.encoder_embed_dim = encoder_embed_dim
         self.decoder_embed_dim = decoder_embed_dim
 
@@ -200,25 +210,48 @@ class DJEPA(nn.Module):
             if m.weight is not None:
                 nn.init.constant_(m.weight, 1.0)
 
-    def patchify(self, x):
+    def patchify_2d(self, x):
         p = self.patch_size
-
         x = F.unfold(x, kernel_size=(p, p), stride=p)
         x = x.transpose(1, 2)
-
         return x  # [n, l, d]
 
-    def unpatchify(self, x):
+    def unpatchify_2d(self, x):
         bsz = x.shape[0]
         p = self.patch_size
         c = self.vae_embed_dim
         h_, w_ = self.seq_h, self.seq_w
-
         x = x.transpose(1, 2).reshape(bsz, c * p * p, h_ * w_)
         x = F.fold(x, output_size=(h_ * p, w_ * p),
                    kernel_size=(p, p), stride=p)
-
         return x  # [n, c, h, w]
+
+    def patchify_3d(self, x):
+        p = self.patch_size
+        gh, gw, gd = self.seq_h, self.seq_w, self.seq_d
+        B, C, H, W, D = x.shape
+        x = x.view(B, C, gh, p, gw, p, gd, p)
+        x = x.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
+        return x.view(B, gh * gw * gd, C * (p ** 3))
+
+    def unpatchify_3d(self, x):
+        bsz = x.shape[0]
+        p = self.patch_size
+        c = self.vae_embed_dim
+        gh, gw, gd = self.seq_h, self.seq_w, self.seq_d
+        x = x.view(bsz, gh, gw, gd, c, p, p, p)
+        x = x.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        return x.view(bsz, c, gh * p, gw * p, gd * p)
+
+    def patchify(self, x):
+        if getattr(self, "spatial_dims", 2) == 3:
+            return self.patchify_3d(x)
+        return self.patchify_2d(x)
+
+    def unpatchify(self, x):
+        if getattr(self, "spatial_dims", 2) == 3:
+            return self.unpatchify_3d(x)
+        return self.unpatchify_2d(x)
 
     def sample_orders(self, bsz):
         # generate a batch of random generation orders
@@ -227,7 +260,8 @@ class DJEPA(nn.Module):
             order = np.array(list(range(self.seq_len)))
             np.random.shuffle(order)
             orders.append(order)
-        orders = torch.Tensor(np.array(orders)).cuda().long()
+        device = self.fake_latent.device if hasattr(self, "fake_latent") else torch.device("cuda")
+        orders = torch.from_numpy(np.array(orders)).to(device).long()
         return orders
 
     def random_masking(self, x, orders):
@@ -387,9 +421,10 @@ class DJEPA(nn.Module):
 
     def sample_tokens(self, bsz, num_iter=64, cfg_scale=1.0, cfg_schedule="linear", labels=None, temperature=1.0, time_shifting_factor=1.0, progress=False):
 
+        device = self.fake_latent.device if hasattr(self, "fake_latent") else torch.device("cuda")
         # init and sample generation orders
-        mask = torch.ones(bsz, self.seq_len).cuda()
-        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim).cuda()
+        mask = torch.ones(bsz, self.seq_len, device=device)
+        tokens = torch.zeros(bsz, self.seq_len, self.token_embed_dim, device=device)
         orders = self.sample_orders(bsz)
 
         indices = list(range(num_iter))
@@ -418,11 +453,11 @@ class DJEPA(nn.Module):
 
             # mask ratio for the next round, following MaskGIT and MAGE.
             mask_ratio = np.cos(math.pi / 2. * (step + 1) / num_iter)
-            mask_len = torch.Tensor(
-                [np.floor(self.seq_len * mask_ratio)]).cuda()
+            mask_len = torch.tensor(
+                [np.floor(self.seq_len * mask_ratio)], device=device)
 
             # masks out at least one for the next iteration
-            mask_len = torch.maximum(torch.Tensor([1]).cuda(),
+            mask_len = torch.maximum(torch.tensor([1], device=device),
                                      torch.minimum(torch.sum(mask, dim=-1, keepdims=True) - 1, mask_len))  # type: ignore
 
             # get masking for next iteration and locations to be predicted in this iteration
@@ -497,5 +532,44 @@ def djepa_huge(**kwargs):
         encoder_embed_dim=1280, encoder_depth=32, encoder_num_heads=16,
         decoder_embed_dim=1280, decoder_depth=32, decoder_num_heads=16,
         mlp_ratio=4, diffloss_d=12, diffloss_w=1536,
+        **kwargs)
+    return model
+
+
+def med_djepa_base(**kwargs):
+    """
+    Med-D-JEPA model for 3D Brain MRI (BraTS2019 tumor ROIs / OASIS-1 whole brain).
+    Input: 128^3 volume -> 8x VAE -> 16^3 latent -> patch_size 2 -> 512 tokens.
+    Token embed dim = 4 * (2^3) = 32.
+    """
+    model = DJEPA(
+        spatial_dims=3,
+        img_size=128,
+        vae_stride=8,
+        patch_size=2,
+        vae_embed_dim=4,
+        encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
+        decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
+        mlp_ratio=4, diffloss_d=6, diffloss_w=1024,
+        class_num=2,  # 2 for LGG/HGG or CN/AD
+        **kwargs)
+    return model
+
+
+def med_djepa_256(**kwargs):
+    """
+    Med-D-JEPA model for BraTS2020 256^3 Whole-Brain MRI.
+    Input: 256^3 volume -> 8x VAE -> 32^3 latent -> patch_size 2 -> 4096 tokens.
+    """
+    model = DJEPA(
+        spatial_dims=3,
+        img_size=256,
+        vae_stride=8,
+        patch_size=2,
+        vae_embed_dim=4,
+        encoder_embed_dim=768, encoder_depth=12, encoder_num_heads=12,
+        decoder_embed_dim=768, decoder_depth=12, decoder_num_heads=12,
+        mlp_ratio=4, diffloss_d=6, diffloss_w=1024,
+        class_num=1,  # Unconditional
         **kwargs)
     return model

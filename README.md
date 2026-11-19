@@ -1,57 +1,241 @@
-# D-JEPA: Denoising with a Joint-Embedding Predictive Architecture
+# Med-D-JEPA: Joint-Embedding Predictive Generation for 3D Brain MRI
 
-The official implementation of the paper "Denoising with a Joint-Embedding Predictive Architecture".
+PyTorch implementation of **Med-D-JEPA** based on the paper:  
+> **Beyond Representation Learning: A Systematic Study of Joint-Embedding Predictive Generation for 3D Brain MRI**  
+> *Meng Zhou, Wenhao You, Yuxing Chen, Yueying Tian*  
+> arXiv:2608.28787
 
-![Samples](misc/teaser.png)
+Med-D-JEPA adapts Joint-Embedding Predictive Architectures (JEPAs) and Denoising JEPA (D-JEPA) for 3D volumetric medical imaging (Brain MRI). By operating on continuous 3D latent tokens produced by a 3D KL-regularized adversarial autoencoder, Med-D-JEPA combines representation-level alignment, per-token diffusion, and iterative next-set-of-token sampling to synthesize high-fidelity, anatomically consistent 3D MRI volumes.
 
-[Homepage](https://d-jepa.github.io/) | [Paper](https://arxiv.org/abs/2410.03755)
+---
 
-![Pipeline](misc/pipeline.png)
+## Architecture Overview
 
-## Installation
+Med-D-JEPA operates in three stages:
 
-1. Create a conda environment and install dependencies: `conda env create -f environment.yml`
-
-2. Download [KL16-VAE](https://www.dropbox.com/scl/fi/hhmuvaiacrarfg28qxhwz/kl16.ckpt?e=2&rlkey=l44xipsezc8atcffdp4q7mwmh&dl=0) pretrained by [MAR](https://github.com/LTH14/mar), then put it in: `pretrained_models/vae/kl16.ckpt`.
-
-## Pretrained Models
-
-[HuggingeFace](https://huggingface.co/densechen/d-jepa-imagenet)
-
-|  Model   | #Params | FID (w/o cfg) |
-| :------: | :-----: | :-----------: |
-| D-JEPA-B |  212M   |     3.40      |
-| D-JEPA-L |  687M   |     2.32      |
-| D-JEPA-H |  1.4B   |     2.04      |
-
-## Scripts
-
-1. Cache VAE latents:
-   ```sh
-   bash scripts/cache_vae.sh
-   ```
-2. Train/Evaluate D-JEPA:
-   ```sh
-   bash scripts/djepa_base/large/huge.sh
-   ```
-
-**Note:** Before running scripts, you should replace the preset parameters in the scripts.
-
-![Curve](misc/fid_is_dual_axis_plot.png)
-
-## Cite
-
-If you find this work useful, please cite our paper:
-
-```bibtex
-@article{chen2024denoising,
-  title={Denoising with a Joint-Embedding Predictive Architecture},
-  author={Chen, Dengsheng and Hu, Jie and Wei, Xiaoming and Wu, Enhua},
-  journal={arXiv preprint arXiv:2410.03755},
-  year={2024}
-}
+```
+[3D MRI Volume] (128³ or 256³)
+       │
+       ▼  Stage I: 3D KL-VAE-GAN (8× downsampling)
+[Continuous 3D Latent Grid] (4 × 16³ or 4 × 32³)
+       │
+       ▼  3D Patchification (p = 2×2×2)
+[Continuous 3D Latent Tokens] (N = 512 or 4,096 tokens, dp = 32)
+       │
+       ├───► Stage II: Med-D-JEPA Joint Training
+       │        ├── Context Encoder (ϕ) on visible tokens
+       │        ├── Target Encoder (ϕ̄) via EMA (α = 0.999)
+       │        ├── Feature Predictor (ψ) predicting representations h_i
+       │        ├── Projection MLP g(·) with L1 Loss (L_pred)
+       │        └── Denoising MLP (ε_θ) with Per-Token Diffusion Loss (L_diff)
+       │
+       ▼  Stage III: Iterative 3D Latent Generation
+       │        ├── Start with 100% masked 3D grid
+       │        ├── Progressive K = 64 AR steps with Cosine Masking Schedule
+       │        ├── Per-token reverse DDPM diffusion (T_diff = 100) conditioned on h_i
+       │        ├── Classifier-Free Guidance (s_cfg = 2.0)
+       │        └── Unpatchify tokens back into 3D continuous latent grid
+       │
+       ▼  Frozen Stage I VAE Decoder
+[Synthesized 3D MRI Volume] (128³ or 256³)
 ```
 
-## Acknowledgements
+---
 
-A large portion of codes in this repo is based on [MAR](https://github.com/LTH14/mar).
+## Key Dimensions & Specifications
+
+| Dataset | Volume Scope | Resolution | VAE Downsample | Latent Grid ($c_z \times h \times w \times d$) | Patch Size ($p$) | Token Count ($N$) | Token Dim ($d_p$) | Classes |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **BraTS2019** | Tumor ROI (FLAIR) | $128 \times 128 \times 128$ | $8\times$ | $4 \times 16 \times 16 \times 16$ | $2 \times 2 \times 2$ | **512** | $4 \times 2^3 = \mathbf{32}$ | 2 (LGG / HGG) |
+| **OASIS-1** | Whole-Brain (T1) | $128 \times 128 \times 128$ | $8\times$ | $4 \times 16 \times 16 \times 16$ | $2 \times 2 \times 2$ | **512** | $4 \times 2^3 = \mathbf{32}$ | 2 (CN / AD) |
+| **BraTS2020** | Whole-Brain (FLAIR) | $256 \times 256 \times 256$ | $8\times$ | $4 \times 32 \times 32 \times 32$ | $2 \times 2 \times 2$ | **4,096** | $4 \times 2^3 = \mathbf{32}$ | 1 (Unconditional) |
+
+---
+
+## Detailed Method Formulation
+
+### Stage I: Continuous 3D Latent Compression (3D KL-VAE-GAN)
+Trained on normalized 3D volumes $x \in [0, 1]^{1 \times H \times W \times D}$ using combined objectives:
+$$\min_{E, G} \max_{D_{\text{adv}}} \left( \lambda_1 \mathcal{L}_{\text{recon}} + \lambda_2 \mathcal{L}_{\text{lpips}} + \lambda_3 \mathcal{L}_{\text{grad}} + \lambda_4 \mathcal{L}_{\text{reg}} + \lambda_5 \mathcal{L}_{\text{adv}} \right)$$
+
+- $\mathcal{L}_{\text{recon}}$: Voxel-level L1 reconstruction loss ($\lambda_1 = 2.0$)
+- $\mathcal{L}_{\text{lpips}}$: Slice-wise 2.5D AlexNet perceptual loss ($\lambda_2 = 0.5$)
+- $\mathcal{L}_{\text{grad}}$: 3D spatial gradient loss across $Z, Y, X$ axes ($\lambda_3 = 1.0$)
+- $\mathcal{L}_{\text{reg}}$: KL divergence with standard normal prior ($\lambda_4 = 1 \times 10^{-7}$)  
+  *KL Warmup Schedule*: $\lambda_4$ is held at 0 for step $1 \dots 1000$ and linearly warmed up over steps $1000 \dots 2000$.
+- $\mathcal{L}_{\text{adv}}$: Least-squares PatchGAN adversarial loss with 3D discriminator ($\lambda_5 = 1.0$)
+
+### Stage II: Med-D-JEPA Joint Training
+Operates on non-overlapping 3D patches $X = \{x_i\}_{i=1}^N \in \mathbb{R}^{d_p}$.
+- **Context Encoder ($\phi$)**: Vision Transformer encoding visible tokens.
+- **Target Encoder ($\bar{\phi}$)**: EMA copy ($\alpha = 0.999$) encoding the complete token sequence.
+- **Feature Predictor ($\psi$)**: Estimates context representations $h_i$ at masked locations $i \in \mathcal{M}$.
+- **L1 Prediction Loss**: $\mathcal{L}_{\text{pred}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \|g(h_i) - y_i\|_1$
+- **Per-Token Diffusion Loss**: $\mathcal{L}_{\text{diff}} = \frac{1}{|\mathcal{M}|} \sum_{i \in \mathcal{M}} \mathbb{E}_{t, \epsilon_i} \left[ \|\epsilon_i - \epsilon_\theta(x_i^t \mid t, h_i)\|_2^2 \right]$
+- **Total Loss**: $\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{pred}} + \mathcal{L}_{\text{diff}}$
+
+### Stage III: Iterative 3D Latent Generation
+- Starts with a 100% masked grid of $N$ tokens.
+- Over $K = 64$ autoregressive iterations, uses a cosine masking schedule:
+  $$\gamma(k/K) = \cos\left(\frac{\pi}{2} \frac{k}{K}\right)$$
+- Denoises newly unmasked tokens via reverse diffusion ($T_{\text{diff}} = 100$ steps):
+  $$x_i^{t-1} = \frac{1}{\sqrt{\alpha_t}} \left( x_i^t - \frac{1 - \alpha_t}{\sqrt{1 - \bar{\alpha}_t}} \epsilon_\theta(x_i^t \mid t, h_i) \right) + \sigma_t \delta_t$$
+- Applies Classifier-Free Guidance ($s_{\text{cfg}} = 2.0$):
+  $$h_i = h_i^{\text{uncond}} + s_{\text{cfg}} \cdot (h_i^{\text{cond}} - h_i^{\text{uncond}})$$
+- Assembled tokens are rearranged via inverse patchification and decoded into 3D volumes by the frozen Stage I VAE decoder.
+
+---
+
+## Installation & Setup
+
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/Karsuman4298/Med-D-JEPA.git
+   cd Med-D-JEPA
+   ```
+
+2. **Create environment and install dependencies**:
+   ```bash
+   conda create -n med-djepa python=3.10 -y
+   conda activate med-djepa
+   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+   pip install monai[all] timm scipy tqdm nibabel
+   ```
+
+---
+
+## Reproduction & Usage Guide
+
+### 1. Data Preparation
+Normalize all brain MRI volumes to $[0, 1]$ and save as `.npy` or `.pt` tensors of shape `(1, 128, 128, 128)` (or `(1, 256, 256, 256)`).
+Organize by class for conditional generation:
+```
+data/brats2019_128/
+  ├── 0/   # Low-Grade Glioma (LGG)
+  │   ├── vol_001.npy
+  │   └── ...
+  └── 1/   # High-Grade Glioma (HGG)
+      ├── vol_101.npy
+      └── ...
+```
+
+### 2. Stage I: Train 3D KL-VAE-GAN
+Train the volume compression autoencoder:
+```bash
+bash scripts/train_med_stage1.sh
+```
+Or run directly:
+```bash
+python train_stage1_vae.py \
+  --data_path ./data/brats2019_128 \
+  --output_dir ./exps/stage1_vae \
+  --img_size 128 \
+  --batch_size 4 \
+  --epochs 5000 \
+  --lr 1e-4 \
+  --min_lr 1e-6 \
+  --warmup_steps 1000
+```
+*Saves the trained VAE to `pretrained_models/vae/med_vae3d.pt`.*
+
+### 3. Extract & Cache 3D Latents
+Encode volumes to continuous 3D latents $(4 \times 16 \times 16 \times 16)$ for Stage II training:
+```bash
+bash scripts/cache_med_latents.sh
+```
+Or run directly:
+```bash
+python main_cache_3d.py \
+  --data_path ./data/brats2019_128 \
+  --cached_path ./cached_latents/brats2019 \
+  --vae MED_VAE_3D \
+  --batch_size 4
+```
+
+### 4. Stage II: Train Med-D-JEPA
+Train the continuous joint-embedding model on the cached latents:
+```bash
+torchrun --nproc_per_node=4 main_djepa.py \
+  --model med_djepa_base \
+  --img_size 128 \
+  --vae MED_VAE_3D \
+  --patch_size 2 \
+  --spatial_dims 3 \
+  --batch_size 8 \
+  --epochs 3000 \
+  --blr 3.0e-4 \
+  --min_lr 5.0e-6 \
+  --weight_decay 0.01 \
+  --diffusion_weight 1.0 \
+  --jepa_weight 1.0 \
+  --num_classes 2 \
+  --data_path ./cached_latents/brats2019 \
+  --use_cached
+```
+
+### 5. Stage III: Iterative 3D Latent Generation
+Synthesize 3D MRI volumes using $K = 64$ autoregressive iterations and CFG scale $2.0$:
+```bash
+bash scripts/generate_med_stage3.sh
+```
+Or run with custom parameters:
+```bash
+python generate_stage3_3d.py \
+  --vae_ckpt pretrained_models/vae/med_vae3d.pt \
+  --ckpt_path exps/med_djepa/checkpoint-last.pth \
+  --output_dir ./generated_samples/brats2019 \
+  --num_volumes 50 \
+  --batch_size 2 \
+  --num_ar_steps 64 \
+  --cfg_scale 2.0 \
+  --class_idx 1 \
+  --img_size 128
+```
+*Outputs:*
+- `vol_0000_cls1.npy`: 3D synthesized volume `(1, 128, 128, 128)`
+- `ortho_0000_cls1.png`: Triptych showing central **Axial**, **Coronal**, and **Sagittal** slices.
+
+---
+
+## Directory Structure
+
+```
+├── models/
+│   ├── vae_3d.py              # Stage I: 3D AutoencoderKL + PatchDiscriminator + 3D Gradient Loss
+│   ├── pretrained_vae.py      # VAE loader supporting 2D and 3D (MED_VAE_3D)
+│   ├── djepa.py               # Calibrated D-JEPA with 3D patchify/unpatchify & med_djepa presets
+│   ├── denoising_mlp.py       # Compact AdaLN residual MLP for per-token reverse diffusion
+│   ├── jepaloss.py            # Prediction loss L_pred & 2-layer projection MLP
+│   └── diffloss/              # Gaussian diffusion loss & DDPM sampling
+├── train_stage1_vae.py        # Stage I 3D VAE-GAN training pipeline
+├── main_cache_3d.py           # Stage I 3D latent caching script
+├── generate_stage3_3d.py      # Stage III iterative 3D generation & slice visualization script
+├── main_djepa.py              # Stage II training script
+├── engine/                    # Training and evaluation loops
+└── scripts/
+    ├── train_med_stage1.sh    # Runner for Stage I training
+    ├── cache_med_latents.sh   # Runner for latent extraction
+    └── generate_med_stage3.sh # Runner for Stage III generation
+```
+
+---
+
+## Citation
+
+If you use this work or findings from the paper, please cite:
+
+```bibtex
+@article{zhou2026meddjepa,
+  title={Beyond Representation Learning: A Systematic Study of Joint-Embedding Predictive Generation for 3D Brain MRI},
+  author={Zhou, Meng and You, Wenhao and Chen, Yuxing and Tian, Yueying},
+  journal={arXiv preprint arXiv:2608.28787},
+  year={2026}
+}
+
+@inproceedings{chen2025djepa,
+  title={Denoising with a Joint-Embedding Predictive Architecture},
+  author={Chen, Dengsheng and Hu, Jie and Wei, Xiaoming and Wu, Enhua},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025}
+}
+```
