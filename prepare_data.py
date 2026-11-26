@@ -175,20 +175,31 @@ def main():
             csv_path = csv_candidates[0]
             print(f"Using flattened BraTS2019 layout with {csv_path}")
             all_subdirs = {
-                os.path.basename(p): p
+                os.path.basename(p).lower(): p
                 for p in glob.glob(os.path.join(args.raw_dir, "*"))
                 if os.path.isdir(p)
             }
+            sample_rows = []
             with open(csv_path, newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                for row in reader:
+                fieldnames = reader.fieldnames
+                for idx, row in enumerate(reader):
+                    if idx < 3:
+                        sample_rows.append(dict(row))
                     vals = [v.strip() for v in row.values() if v]
-                    grade = "HGG" if "HGG" in vals else ("LGG" if "LGG" in vals else None)
+                    grade = "HGG" if any(v.upper() == "HGG" for v in vals) else ("LGG" if any(v.upper() == "LGG" for v in vals) else None)
                     if grade is None:
                         continue
-                    matched_dir = next((all_subdirs[v] for v in vals if v in all_subdirs), None)
+                    matched_dir = next((all_subdirs[v.lower()] for v in vals if v.lower() in all_subdirs), None)
                     if matched_dir:
                         grade_to_folders[grade].append(matched_dir)
+
+            if not grade_to_folders["LGG"] and not grade_to_folders["HGG"]:
+                first_folder = sorted(all_subdirs.values())[0] if all_subdirs else None
+                first_files = os.listdir(first_folder) if first_folder else []
+                print(f"[Debug] CSV columns: {fieldnames}")
+                print(f"[Debug] First 3 CSV rows: {sample_rows}")
+                print(f"[Debug] Sample folder ({first_folder}) files: {first_files}")
 
         for tumor_grade, num_test in [("LGG", 25), ("HGG", 25)]:
             patient_folders = sorted(grade_to_folders[tumor_grade])
