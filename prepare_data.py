@@ -19,6 +19,7 @@ Implements Section 4.1 & Appendix A:
 """
 
 import argparse
+import csv
 import os
 import glob
 import random
@@ -155,15 +156,43 @@ def main():
 
     if args.dataset == "brats2019":
         # BraTS2019: Extract ROIs (128^3). Split: 25 HGG test, 25 LGG test
+        lgg_dir = find_grade_dir(args.raw_dir, "LGG")
+        hgg_dir = find_grade_dir(args.raw_dir, "HGG")
+
+        grade_to_folders = {"LGG": [], "HGG": []}
+        if lgg_dir is not None and hgg_dir is not None:
+            grade_to_folders["LGG"] = sorted([p for p in glob.glob(os.path.join(lgg_dir, "*")) if os.path.isdir(p)])
+            grade_to_folders["HGG"] = sorted([p for p in glob.glob(os.path.join(hgg_dir, "*")) if os.path.isdir(p)])
+        else:
+            # Flattened layout (e.g., BraTS19_001..335 + name_mapping.csv)
+            csv_candidates = glob.glob(os.path.join(args.raw_dir, "*name_mapping*.csv"))
+            if not csv_candidates:
+                csv_candidates = glob.glob(os.path.join(args.raw_dir, "**", "*name_mapping*.csv"), recursive=True)
+            if not csv_candidates:
+                raise FileNotFoundError(
+                    f"Could not find LGG/HGG folders or name_mapping.csv under {args.raw_dir}"
+                )
+            csv_path = csv_candidates[0]
+            print(f"Using flattened BraTS2019 layout with {csv_path}")
+            all_subdirs = {
+                os.path.basename(p): p
+                for p in glob.glob(os.path.join(args.raw_dir, "*"))
+                if os.path.isdir(p)
+            }
+            with open(csv_path, newline="", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    vals = [v.strip() for v in row.values() if v]
+                    grade = "HGG" if "HGG" in vals else ("LGG" if "LGG" in vals else None)
+                    if grade is None:
+                        continue
+                    matched_dir = next((all_subdirs[v] for v in vals if v in all_subdirs), None)
+                    if matched_dir:
+                        grade_to_folders[grade].append(matched_dir)
+
         for tumor_grade, num_test in [("LGG", 25), ("HGG", 25)]:
-            grade_dir = find_grade_dir(args.raw_dir, tumor_grade)
-            if grade_dir is None:
-                contents = os.listdir(args.raw_dir) if os.path.isdir(args.raw_dir) else []
-                print(f"Warning: Could not find '{tumor_grade}' folder under {args.raw_dir}. Top-level contents: {contents}")
-                patient_folders = []
-            else:
-                patient_folders = sorted([p for p in glob.glob(os.path.join(grade_dir, "*")) if os.path.isdir(p)])
-                print(f"Found {len(patient_folders)} {tumor_grade} patients in {grade_dir}.")
+            patient_folders = sorted(grade_to_folders[tumor_grade])
+            print(f"Found {len(patient_folders)} {tumor_grade} patients.")
             processed = []
             for folder in patient_folders:
                 pid = os.path.basename(folder)
