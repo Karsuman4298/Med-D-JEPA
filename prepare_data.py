@@ -179,27 +179,33 @@ def main():
                 for p in glob.glob(os.path.join(args.raw_dir, "*"))
                 if os.path.isdir(p)
             }
-            sample_rows = []
+            csv_grades = []
             with open(csv_path, newline="", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames
-                for idx, row in enumerate(reader):
-                    if idx < 3:
-                        sample_rows.append(dict(row))
+                for row in reader:
                     vals = [v.strip() for v in row.values() if v]
                     grade = "HGG" if any(v.upper() == "HGG" for v in vals) else ("LGG" if any(v.upper() == "LGG" for v in vals) else None)
                     if grade is None:
                         continue
+                    csv_grades.append(grade)
                     matched_dir = next((all_subdirs[v.lower()] for v in vals if v.lower() in all_subdirs), None)
                     if matched_dir:
                         grade_to_folders[grade].append(matched_dir)
 
             if not grade_to_folders["LGG"] and not grade_to_folders["HGG"]:
-                first_folder = sorted(all_subdirs.values())[0] if all_subdirs else None
-                first_files = os.listdir(first_folder) if first_folder else []
-                print(f"[Debug] CSV columns: {fieldnames}")
-                print(f"[Debug] First 3 CSV rows: {sample_rows}")
-                print(f"[Debug] Sample folder ({first_folder}) files: {first_files}")
+                sorted_folders = [all_subdirs[k] for k in sorted(all_subdirs.keys())]
+                if len(csv_grades) == len(sorted_folders) and len(sorted_folders) > 0:
+                    for folder_path, grade in zip(sorted_folders, csv_grades):
+                        grade_to_folders[grade].append(folder_path)
+                    print(
+                        f"Mapped {len(sorted_folders)} folders sequentially to {csv_path} "
+                        f"({len(grade_to_folders['LGG'])} LGG, {len(grade_to_folders['HGG'])} HGG)."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Could not match folder names to {csv_path}: "
+                        f"{len(sorted_folders)} folders vs {len(csv_grades)} CSV rows."
+                    )
 
         for tumor_grade, num_test in [("LGG", 25), ("HGG", 25)]:
             patient_folders = sorted(grade_to_folders[tumor_grade])
