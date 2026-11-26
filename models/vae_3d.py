@@ -1,3 +1,4 @@
+import inspect
 import math
 import torch
 import torch.nn as nn
@@ -77,22 +78,27 @@ class Stage1MedVAEGAN(nn.Module):
             )
 
         # 8x spatial downsampling (e.g. 128^3 -> 16^3)
+        # MONAI >=1.4 uses 'channels'; monai-generative uses 'num_channels'
+        vae_sig = inspect.signature(AutoencoderKL.__init__).parameters
+        vae_ch_key = "channels" if "channels" in vae_sig else "num_channels"
         self.vae = AutoencoderKL(
             spatial_dims=3,
             in_channels=in_channels,
             out_channels=in_channels,
-            num_channels=(32, 64, 128, 256),
             latent_channels=latent_channels,
             num_res_blocks=2,
             norm_num_groups=16,
             attention_levels=(False, False, False, True),
+            **{vae_ch_key: (32, 64, 128, 256)},
         )
 
+        disc_sig = inspect.signature(PatchDiscriminator.__init__).parameters
+        disc_ch_key = "channels" if "channels" in disc_sig else "num_channels"
         self.discriminator = PatchDiscriminator(
             spatial_dims=3,
             num_layers_d=3,
-            num_channels=32,
             in_channels=in_channels,
+            **{disc_ch_key: 32},
         )
 
         # 2.5D slice-wise perceptual loss (AlexNet)

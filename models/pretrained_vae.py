@@ -1,3 +1,4 @@
+import inspect
 import os
 import torch
 import torch.nn as nn
@@ -20,7 +21,7 @@ VAE = {
             spatial_dims=3,
             in_channels=1,
             out_channels=1,
-            num_channels=(32, 64, 128, 256),
+            channels=(32, 64, 128, 256),
             latent_channels=4,
             num_res_blocks=2,
             norm_num_groups=16,
@@ -46,7 +47,11 @@ def get_pretrained_vae(args):
 
         if spatial_dims == 3:
             from monai.networks.nets import AutoencoderKL
-            vae = AutoencoderKL(**vae_dict["kwargs"])
+            vae_kwargs = dict(vae_dict["kwargs"])
+            vae_sig = inspect.signature(AutoencoderKL.__init__).parameters
+            if "channels" not in vae_sig and "num_channels" in vae_sig and "channels" in vae_kwargs:
+                vae_kwargs["num_channels"] = vae_kwargs.pop("channels")
+            vae = AutoencoderKL(**vae_kwargs)
             if os.path.exists(ckpt_path):
                 state_dict = torch.load(ckpt_path, map_location="cpu")
                 # Handle state_dict wrapped in Stage1MedVAEGAN
