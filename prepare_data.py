@@ -125,6 +125,19 @@ def split_and_save(samples: list, train_dir: str, test_dir: str, num_test: int):
         np.save(os.path.join(test_dir, path), data)
 
 
+def find_grade_dir(raw_dir: str, tumor_grade: str):
+    """Recursively locates the LGG/HGG directory under raw_dir (case-insensitive)."""
+    direct = os.path.join(raw_dir, tumor_grade)
+    if os.path.isdir(direct):
+        return direct
+    target = tumor_grade.lower()
+    for root, dirs, _ in os.walk(raw_dir):
+        for d in dirs:
+            if d.lower() == target:
+                return os.path.join(root, d)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser("Med-D-JEPA Dataset Preprocessing")
     parser.add_argument("--dataset", type=str, required=True, choices=["brats2019", "oasis1", "brats2020"])
@@ -135,17 +148,23 @@ def main():
     if not MONAI_AVAILABLE:
         raise ImportError("nibabel and monai are required. Run: pip install nibabel monai")
 
+    if not os.path.exists(args.raw_dir):
+        raise FileNotFoundError(f"raw_dir does not exist: {args.raw_dir}")
+
     print(f"--- Processing {args.dataset.upper()} from {args.raw_dir} ---")
 
     if args.dataset == "brats2019":
         # BraTS2019: Extract ROIs (128^3). Split: 25 HGG test, 25 LGG test
         for tumor_grade, num_test in [("LGG", 25), ("HGG", 25)]:
-            grade_dir = os.path.join(args.raw_dir, tumor_grade)
-            if not os.path.isdir(grade_dir):
-                grade_dir = os.path.join(args.raw_dir, "MICCAI_BraTS_2019_Data_Training", tumor_grade)
-            patient_folders = sorted([p for p in glob.glob(os.path.join(grade_dir, "*")) if os.path.isdir(p)])
+            grade_dir = find_grade_dir(args.raw_dir, tumor_grade)
+            if grade_dir is None:
+                contents = os.listdir(args.raw_dir) if os.path.isdir(args.raw_dir) else []
+                print(f"Warning: Could not find '{tumor_grade}' folder under {args.raw_dir}. Top-level contents: {contents}")
+                patient_folders = []
+            else:
+                patient_folders = sorted([p for p in glob.glob(os.path.join(grade_dir, "*")) if os.path.isdir(p)])
+                print(f"Found {len(patient_folders)} {tumor_grade} patients in {grade_dir}.")
             processed = []
-            print(f"Found {len(patient_folders)} {tumor_grade} patients in {grade_dir}.")
             for folder in patient_folders:
                 pid = os.path.basename(folder)
                 flair = glob.glob(os.path.join(folder, "*_flair.nii*"))
