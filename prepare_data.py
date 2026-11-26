@@ -140,13 +140,16 @@ def main():
     if args.dataset == "brats2019":
         # BraTS2019: Extract ROIs (128^3). Split: 25 HGG test, 25 LGG test
         for tumor_grade, num_test in [("LGG", 25), ("HGG", 25)]:
-            patient_folders = glob.glob(os.path.join(args.raw_dir, f"MICCAI_BraTS_2019_Data_Training/{tumor_grade}/*"))
+            grade_dir = os.path.join(args.raw_dir, tumor_grade)
+            if not os.path.isdir(grade_dir):
+                grade_dir = os.path.join(args.raw_dir, "MICCAI_BraTS_2019_Data_Training", tumor_grade)
+            patient_folders = sorted([p for p in glob.glob(os.path.join(grade_dir, "*")) if os.path.isdir(p)])
             processed = []
-            print(f"Found {len(patient_folders)} {tumor_grade} patients.")
+            print(f"Found {len(patient_folders)} {tumor_grade} patients in {grade_dir}.")
             for folder in patient_folders:
                 pid = os.path.basename(folder)
-                flair = glob.glob(os.path.join(folder, "*_flair.nii.gz"))
-                seg = glob.glob(os.path.join(folder, "*_seg.nii.gz"))
+                flair = glob.glob(os.path.join(folder, "*_flair.nii*"))
+                seg = glob.glob(os.path.join(folder, "*_seg.nii*"))
                 if flair and seg:
                     vol = process_brats2019_roi(flair[0], seg[0], target_size=128)
                     processed.append((f"{pid}.npy", vol))
