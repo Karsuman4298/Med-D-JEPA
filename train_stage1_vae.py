@@ -28,7 +28,7 @@ class NpyMriDataset(Dataset):
     Dataset loader for preprocessed 3D MRI volumes (.npy or .pt).
     Volumes must be normalized to [0, 1] with shape (1, H, W, D).
     """
-    def __init__(self, data_root: str):
+    def __init__(self, data_root: str, cache_in_ram: bool = False):
         self.files = []
         for root, _, filenames in os.walk(data_root):
             for f in filenames:
@@ -37,12 +37,12 @@ class NpyMriDataset(Dataset):
         self.files.sort()
         if len(self.files) == 0:
             print(f"Warning: No .npy or .pt files found in {data_root}")
+        self.cache = None
+        if cache_in_ram and len(self.files) > 0:
+            print(f"Preloading {len(self.files)} volumes into RAM...")
+            self.cache = [self._load_item(p) for p in self.files]
 
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        path = self.files[idx]
+    def _load_item(self, path: str) -> torch.Tensor:
         if path.endswith('.npy'):
             arr = np.load(path).astype(np.float32)
             tensor = torch.from_numpy(arr)
@@ -51,6 +51,14 @@ class NpyMriDataset(Dataset):
         if tensor.ndim == 3:
             tensor = tensor.unsqueeze(0)  # (1, H, W, D)
         return tensor
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        if self.cache is not None:
+            return self.cache[idx]
+        return self._load_item(self.files[idx])
 
 
 def adjust_learning_rate(optimizer, step, warmup_steps, total_steps, base_lr, min_lr):
@@ -77,11 +85,25 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=1000, help="Learning rate warmup steps")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_freq", type=int, default=500, help="Checkpoint frequency in epochs")
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=1)
+    parser.add_argument("--no_amp", action="store_true", help="Disable mixed precision training")
+    parser.add_argument("--cache_in_ram", action="store_true", help="Preload dataset volumes into RAM to avoid disk I/O")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # Configure mixed precision (bf16 if supported, else fp16 with GradScaler)
+    amp_dtype = None
+    scaler_g, scaler_d = None, None
+    if not args.no_amp and device.type == "cuda":
+        if torch.cuda.is_bf16_supported():
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+            scaler_g = torch.amp.GradScaler("cuda")
+            scaler_d = torch.amp.GradScaler("cuda")
+        print(f"Using mixed precision: {amp_dtype}")
 
     # 1. Initialize Stage 1 Model
     model = Stage1MedVAEGAN(in_channels=1, latent_channels=4).to(device)
@@ -91,7 +113,7 @@ def main():
     opt_d = torch.optim.Adam(model.discriminator.parameters(), lr=args.lr, betas=(0.5, 0.9))
 
     # 3. Dataloader
-    dataset = NpyMriDataset(args.data_path)
+    dataset = NpyMriDataset(args.data_path, cache_in_ram=args.cache_in_ram)
     if len(dataset) == 0:
         print(f"Dataset at {args.data_path} is empty. Please check data directory.")
         return
@@ -100,8 +122,8 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+        num_workers=0 if args.cache_in_ram else args.num_workers,
+        pin_memory=device.type == "cuda",
         drop_last=True
     )
 
@@ -116,7 +138,7 @@ def main():
 
         for batch in loader:
             global_step += 1
-            x = batch.to(device)
+            x = batch.to(device, non_blocking=True)
 
             # Cosine decay schedule
             lr = adjust_learning_rate(
@@ -127,7 +149,10 @@ def main():
             )
 
             # Execute Generator and Discriminator steps
-            losses = model.train_step(x, opt_g, opt_d, global_step=global_step)
+            losses = model.train_step(
+                x, opt_g, opt_d, global_step=global_step,
+                amp_dtype=amp_dtype, scaler_g=scaler_g, scaler_d=scaler_d
+            )
             epoch_loss_g += losses["loss_g"]
             epoch_loss_d += losses["loss_d"]
 

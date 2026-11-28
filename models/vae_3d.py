@@ -120,14 +120,25 @@ class Stage1MedVAEGAN(nn.Module):
 
     def compute_kl(self, z_mu: torch.Tensor, z_sigma: torch.Tensor) -> torch.Tensor:
         """Kullback-Leibler divergence with standard normal prior."""
-        # MONAI AutoencoderKL returns z_sigma as standard deviation
+        # MONAI AutoencoderKL returns z_sigma as standard deviation; compute in fp32 for stability
+        z_mu = z_mu.float()
+        z_sigma = z_sigma.float()
         kl = 0.5 * torch.sum(
             z_mu.pow(2) + z_sigma.pow(2) - torch.log(z_sigma.pow(2) + 1e-8) - 1,
             dim=[1, 2, 3, 4]
         )
         return torch.mean(kl)
 
-    def train_step(self, x: torch.Tensor, opt_g: torch.optim.Optimizer, opt_d: torch.optim.Optimizer, global_step: int):
+    def train_step(
+        self,
+        x: torch.Tensor,
+        opt_g: torch.optim.Optimizer,
+        opt_d: torch.optim.Optimizer,
+        global_step: int,
+        amp_dtype=None,
+        scaler_g=None,
+        scaler_d=None,
+    ):
         """
         Executes one training step with exact paper weights:
         lambda_1 = 2.0 (L_recon)
@@ -136,41 +147,56 @@ class Stage1MedVAEGAN(nn.Module):
         lambda_4 = 1e-7 (L_reg, warmed up after step 1000)
         lambda_5 = 1.0 (L_adv)
         """
+        use_amp = amp_dtype is not None and x.is_cuda
+
         # --- 1. Generator (VAE) Update ---
-        opt_g.zero_grad()
-        recon, z_mu, z_sigma = self.vae(x)
+        opt_g.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            recon, z_mu, z_sigma = self.vae(x)
 
-        l_recon = F.l1_loss(recon, x)
-        l_lpips = self.perceptual_loss(recon, x)
-        l_grad = gradient_loss_3d(recon, x)
-        l_kl = self.compute_kl(z_mu, z_sigma)
+            l_recon = F.l1_loss(recon, x)
+            l_lpips = self.perceptual_loss(recon, x)
+            l_grad = gradient_loss_3d(recon, x)
+            l_kl = self.compute_kl(z_mu, z_sigma)
 
-        # KL warmup schedule (Appendix A): starts at step 1000, linear over 1000 steps
-        kl_scale = min(1.0, max(0.0, (global_step - 1000) / 1000.0))
-        lambda_kl = 1e-7 * kl_scale
+            # KL warmup schedule (Appendix A): starts at step 1000, linear over 1000 steps
+            kl_scale = min(1.0, max(0.0, (global_step - 1000) / 1000.0))
+            lambda_kl = 1e-7 * kl_scale
 
-        disc_out_fake = self.discriminator(recon)
-        logits_fake = disc_out_fake[-1] if isinstance(disc_out_fake, list) else disc_out_fake
-        l_adv = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
+            disc_out_fake = self.discriminator(recon)
+            logits_fake = disc_out_fake[-1] if isinstance(disc_out_fake, list) else disc_out_fake
+            l_adv = self.adv_loss(logits_fake, target_is_real=True, for_discriminator=False)
 
-        loss_g = (2.0 * l_recon) + (0.5 * l_lpips) + (1.0 * l_grad) + (lambda_kl * l_kl) + (1.0 * l_adv)
-        loss_g.backward()
-        opt_g.step()
+            loss_g = (2.0 * l_recon) + (0.5 * l_lpips) + (1.0 * l_grad) + (lambda_kl * l_kl) + (1.0 * l_adv)
+
+        if scaler_g is not None:
+            scaler_g.scale(loss_g).backward()
+            scaler_g.step(opt_g)
+            scaler_g.update()
+        else:
+            loss_g.backward()
+            opt_g.step()
 
         # --- 2. Discriminator Update ---
-        opt_d.zero_grad()
-        disc_out_real = self.discriminator(x)
-        logits_real = disc_out_real[-1] if isinstance(disc_out_real, list) else disc_out_real
+        opt_d.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
+            disc_out_real = self.discriminator(x)
+            logits_real = disc_out_real[-1] if isinstance(disc_out_real, list) else disc_out_real
 
-        disc_out_fake_det = self.discriminator(recon.detach())
-        logits_fake_det = disc_out_fake_det[-1] if isinstance(disc_out_fake_det, list) else disc_out_fake_det
+            disc_out_fake_det = self.discriminator(recon.detach())
+            logits_fake_det = disc_out_fake_det[-1] if isinstance(disc_out_fake_det, list) else disc_out_fake_det
 
-        loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
-        loss_d_fake = self.adv_loss(logits_fake_det, target_is_real=False, for_discriminator=True)
-        loss_d = 0.5 * (loss_d_real + loss_d_fake)
+            loss_d_real = self.adv_loss(logits_real, target_is_real=True, for_discriminator=True)
+            loss_d_fake = self.adv_loss(logits_fake_det, target_is_real=False, for_discriminator=True)
+            loss_d = 0.5 * (loss_d_real + loss_d_fake)
 
-        loss_d.backward()
-        opt_d.step()
+        if scaler_d is not None:
+            scaler_d.scale(loss_d).backward()
+            scaler_d.step(opt_d)
+            scaler_d.update()
+        else:
+            loss_d.backward()
+            opt_d.step()
 
         return {
             "loss_g": loss_g.item(),
