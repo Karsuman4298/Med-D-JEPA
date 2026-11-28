@@ -92,6 +92,10 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     # Configure mixed precision (bf16 if supported, else fp16 with GradScaler)
     amp_dtype = None
